@@ -3,154 +3,184 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
-import sys
+import time
+from collections import deque
 
 from .config import env, load_config
 from .otp import OtpHub
-from .parser import parse_message, should_buy
 from .state import DailyState
 
 
 def _setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    logging.basicConfig(level=logging.INFO, datefmt="%H:%M:%S",
+                        format="%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s")
 
 
-def _tg_client(cfg):
-    from telethon import TelegramClient
-    return TelegramClient(
-        str(cfg.base_dir / cfg.get("telegram.session_name", "fksc")),
-        int(env("TG_API_ID", True)),
-        env("TG_API_HASH", True),
-    )
+def _buyer(cfg, hub=None, notify=None):
+    from .buyer import Buyer
+
+    async def printer(text, url=None):
+        print("\a" + text + (f"  {url}" if url else ""), flush=True)
+    return Buyer(cfg, DailyState(cfg.path("state_file", "state.json")), hub or OtpHub(), notify or printer)
 
 
 async def cmd_login(cfg):
-    """Log in to Telegram (phone + code) and to Flipkart (in a real browser window)."""
-    from .buyer import Buyer
-    client = _tg_client(cfg)
-    await client.start()
-    me = await client.get_me()
-    print(f"Telegram: logged in as {me.first_name}")
-    for ch in cfg.get("telegram.channels", []):
-        ent = await client.get_entity(ch)
-        print(f"  watching: {getattr(ent, 'title', ch)}")
-    await client.disconnect()
-
-    buyer = Buyer(cfg, DailyState(cfg.path("state_file", "state.json")), OtpHub(), _print_notify)
+    """Open a real browser window so you can log in to Flipkart once; the session is kept in browser_profile/."""
+    buyer = _buyer(cfg)
     await buyer.start(headless=False)
     page = await buyer.ctx.new_page()
     await page.goto("https://www.flipkart.com/account/login")
-    print("\nLog in to Flipkart in the browser window (and save your card there if needed).")
-    input("Press Enter here once you're logged in... ")
+    print("Log in to Flipkart in the browser window (phone + OTP). Save your credit card in your")
+    print("Flipkart account too if it isn't saved yet.")
+    await asyncio.to_thread(input, "Press Enter here once you're logged in... ")
     print("Flipkart logged in:", await buyer.is_logged_in())
     await buyer.stop()
 
 
-async def _print_notify(text: str):
-    print("\a" + text, flush=True)
+async def cmd_discover(cfg, urls: list[str]):
+    """Browse Flipkart normally; every SuperCoin mention on any page is recorded."""
+    from .detect import detect
+    from .scanner import CARDS_JS, _json_candidates
+
+    buyer = _buyer(cfg)
+    await buyer.start(headless=False)
+    out_path = cfg.path("buyer.debug_dir", "debug") / "discover.jsonl"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out = open(out_path, "a", encoding="utf-8")
+    pages_with_coins: dict[str, int] = {}
+
+    def record(kind, page_url, data):
+        out.write(json.dumps({"t": time.time(), "kind": kind, "page": page_url, **data}, ensure_ascii=False) + "\n")
+        out.flush()
+
+    async def on_response(page, resp):
+        try:
+            if "flipkart" not in resp.url or "json" not in (resp.headers.get("content-type") or ""):
+                return
+            body = await resp.text()
+            if "supercoin" not in body.lower().replace(" ", ""):
+                return
+            record("api", page.url, {"api_url": resp.url[:300]})
+            for u, text in _json_candidates(json.loads(body), page.url):
+                off = detect(u, text)
+                record("api_offer", page.url, {"url": u, "ratio": off.ratio if off else None, "text": text[:600]})
+        except Exception:
+            pass
+
+    async def on_load(page):
+        try:
+            await page.wait_for_timeout(1500)
+            n = 0
+            for card in await page.evaluate(CARDS_JS):
+                off = detect(card["href"], card["text"])
+                if off:
+                    n += 1
+                    record("dom_offer", page.url, {"url": off.url, "ratio": round(off.ratio, 3), "price": off.price,
+                                                   "coins": off.coins, "pct": off.pct, "text": card["text"][:600]})
+            body = await page.locator("body").inner_text()
+            for line in body.splitlines():
+                if "supercoin" in line.lower().replace(" ", ""):
+                    record("text", page.url, {"line": line.strip()[:300]})
+            if n:
+                pages_with_coins[page.url] = n
+                print(f"  {n:3d} products with SuperCoin offers on {page.url}")
+        except Exception:
+            pass
+
+    def hook(page):
+        page.on("response", lambda r: asyncio.create_task(on_response(page, r)))
+        page.on("load", lambda: asyncio.create_task(on_load(page)))
+
+    buyer.ctx.on("page", hook)
+    for p in buyer.ctx.pages:
+        hook(p)
+    for u in urls:
+        p = await buyer.ctx.new_page()
+        await p.goto(u)
+    print("Browse Flipkart in the window: go wherever you normally see SuperCoin-back deals")
+    print("(SuperCoin zone, offer banners, categories, product pages). Everything is logged to", out_path)
+    await asyncio.to_thread(input, "Press Enter here to stop... ")
+    out.close()
+    print("\nPages where products with SuperCoin offers were found:")
+    for u, n in sorted(pages_with_coins.items(), key=lambda x: -x[1]):
+        print(f"  {n:3d}  {u}")
+    print("\nAdd the useful ones as watched pages in the dashboard (or scanner.sources in config.yaml).")
+    await buyer.stop()
 
 
 async def cmd_run(cfg):
-    from .buyer import Buyer
-    from .listener import attach
+    from aiohttp import web
 
-    client = _tg_client(cfg)
-    await client.start()
-    state = DailyState(cfg.path("state_file", "state.json"))
+    from .scanner import Scanner
+    from .web import make_app
+
+    alerts: deque = deque(maxlen=100)
     hub = OtpHub()
 
-    async def notify(text: str):
+    async def notify(text: str, url: str | None = None):
+        alerts.appendleft({"t": time.time(), "text": text, "url": url})
         if cfg.get("notify.beep", True):
             print("\a", end="", flush=True)
-        logging.getLogger("fksc").warning(text)
-        if cfg.get("notify.telegram_saved_messages", True):
-            try:
-                await client.send_message("me", text, link_preview=False)
-            except Exception:
-                pass
+        logging.getLogger("fksc").warning("%s %s", text, url or "")
 
     if cfg.get("otp_webhook.enabled"):
         await hub.serve(cfg.get("otp_webhook.host", "0.0.0.0"), int(cfg.get("otp_webhook.port", 8765)), env("OTP_WEBHOOK_TOKEN", True))
 
-    buyer = Buyer(cfg, state, hub, notify)
+    buyer = _buyer(cfg, hub, notify)
     await buyer.start()
     if not await buyer.is_logged_in():
-        print("Flipkart session is not logged in. Run: python -m fksc login")
+        print("Flipkart is not logged in in this browser profile. Run: python -m fksc login")
         await buyer.stop()
         return
-    attach(client, cfg, buyer, state, notify)
-    mode = "DRY RUN" if cfg.get("buyer.dry_run", True) else "LIVE"
-    print(f"[{mode}] Listening on {cfg.get('telegram.channels')} — Ctrl+C to stop")
+    scanner = Scanner(cfg, buyer, notify)
+    scanner.sync_sources()
+
+    runner = web.AppRunner(make_app(cfg, scanner, buyer.state, alerts))
+    await runner.setup()
+    host, port = cfg.get("dashboard.host", "127.0.0.1"), int(cfg.get("dashboard.port", 8080))
+    await web.TCPSite(runner, host, port).start()
+    print(f"Dashboard: http://{'127.0.0.1' if host == '0.0.0.0' else host}:{port}   (Ctrl+C to stop)")
     try:
-        await client.run_until_disconnected()
+        await asyncio.Event().wait()
     finally:
         await buyer.stop()
 
 
 async def cmd_buy(cfg, url: str):
-    """Run the purchase flow once on a URL (respects dry_run) to test selectors."""
-    from .buyer import Buyer
     hub = OtpHub()
     if cfg.get("otp_webhook.enabled"):
         await hub.serve(cfg.get("otp_webhook.host", "0.0.0.0"), int(cfg.get("otp_webhook.port", 8765)), env("OTP_WEBHOOK_TOKEN", True))
-    buyer = Buyer(cfg, DailyState(cfg.path("state_file", "state.json")), hub, _print_notify)
+    buyer = _buyer(cfg, hub)
     await buyer.start()
-    res = await buyer.buy(url)
-    print(res)
-    input("Press Enter to close the browser... ")
+    print(await buyer.buy(url))
+    await asyncio.to_thread(input, "Press Enter to close the browser... ")
     await buyer.stop()
-
-
-async def cmd_history(cfg, limit: int):
-    """Replay the last N channel posts through the parser/filter (no buying)."""
-    from .listener import message_urls
-    client = _tg_client(cfg)
-    await client.start()
-    for ch in cfg.get("telegram.channels", []):
-        async for msg in client.iter_messages(ch, limit=limit):
-            deal = parse_message(msg.raw_text or "", message_urls(msg))
-            if not deal:
-                print(f"--- {msg.date:%d %b %H:%M:%S}  (no flipkart link)")
-                continue
-            ok, why = should_buy(deal, cfg.get("filter", {}) or {})
-            print(f"--- {msg.date:%d %b %H:%M:%S}  {'BUY ' if ok else 'skip'} [{why}] price={deal.price} {deal.url}")
-    await client.disconnect()
 
 
 def main(argv=None):
     _setup_logging()
-    ap = argparse.ArgumentParser(prog="fksc", description="Flipkart 100% SuperCoin deal sniper")
+    ap = argparse.ArgumentParser(prog="fksc", description="Flipkart SuperCoin-back deal watcher and auto-buyer")
     ap.add_argument("-c", "--config", default="config.yaml")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("login", help="log in to Telegram and Flipkart (one time)")
-    sub.add_parser("run", help="watch the channel and buy matching deals")
+    sub.add_parser("login", help="log in to Flipkart once in a real browser window")
+    d = sub.add_parser("discover", help="record every SuperCoin offer while you browse")
+    d.add_argument("urls", nargs="*", default=["https://www.flipkart.com/"])
+    sub.add_parser("run", help="watch pages, buy matching deals, serve the dashboard")
     b = sub.add_parser("buy", help="run the buy flow once on a product URL")
     b.add_argument("url")
-    h = sub.add_parser("history", help="test the parser on recent channel posts")
-    h.add_argument("-n", type=int, default=30)
-    p = sub.add_parser("parse", help="test the parser on text from stdin")
     args = ap.parse_args(argv)
-
-    if args.cmd == "parse":
-        cfg_filter = {"require_100_percent": True}
-        deal = parse_message(sys.stdin.read())
-        print(deal, should_buy(deal, cfg_filter) if deal else None)
-        return
     cfg = load_config(args.config)
     try:
         if args.cmd == "login":
             asyncio.run(cmd_login(cfg))
+        elif args.cmd == "discover":
+            asyncio.run(cmd_discover(cfg, args.urls))
         elif args.cmd == "run":
             asyncio.run(cmd_run(cfg))
         elif args.cmd == "buy":
             asyncio.run(cmd_buy(cfg, args.url))
-        elif args.cmd == "history":
-            asyncio.run(cmd_history(cfg, args.n))
     except KeyboardInterrupt:
         pass
 

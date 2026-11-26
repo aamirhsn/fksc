@@ -1,71 +1,59 @@
-# fksc — Flipkart 100% SuperCoin deal sniper
+# fksc — Flipkart SuperCoin-back deal watcher and auto-buyer
 
-Watches Telegram deal channels (e.g. `Flipkart_scdeals_PranayCC`) and, as soon as a post with a
-**100% SuperCoins** Flipkart link appears, drives your already-logged-in Flipkart session through
-**Buy Now → address → order summary → payment** in a real browser.
+Runs on your own computer. It keeps a logged-in Flipkart browser open, reloads the pages you choose,
+finds products whose SuperCoin offer is at least `min_ratio` of the price (default 50%), and
+runs checkout immediately. A local dashboard controls everything.
 
-## Why this is faster than your phone alert
-- It listens as a **Telegram user client** (MTProto push via Telethon), not through phone
-  notifications. Posts arrive in well under a second; each log line shows the measured lag.
-- A Flipkart tab stays warm (cookies, TLS, DNS) so the product page opens immediately.
-- No human in the loop until the bank OTP, and that can be automated too (below).
+> Status: scanner, checkout, OTP webhook and dashboard are tested end to end against a local mock
+> of Flipkart. They have not been run against live Flipkart yet. A faster checkout that calls
+> Flipkart's APIs directly is planned (see "Next").
 
-## Setup (on your own PC, in India)
+## Setup
 ```bash
 python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-playwright install chromium        # or set buyer.browser_channel: chrome to use installed Chrome
+playwright install chromium        # or keep buyer.browser_channel: chrome to use installed Chrome
 cp config.example.yaml config.yaml
-cp .env.example .env               # fill TG_API_ID / TG_API_HASH from https://my.telegram.org
-python -m fksc login               # Telegram phone+code, then log in to Flipkart in the opened window
+cp .env.example .env               # card CVV, OTP webhook token
+python -m fksc login               # log in to Flipkart once in the window that opens
 ```
-In that Flipkart window, **save your credit card on Flipkart** (Flipkart stores it tokenised). Put
-its last 4 digits in `payment.card_last4` and the CVV in `.env` as `FK_CARD_CVV`. Card details
-never go into `config.yaml` or the code, and `.env` is gitignored.
 
 ## Use
 ```bash
-python -m fksc history -n 50       # replay recent channel posts through the filter (no buying)
-python -m fksc buy <product-url>   # run the buy flow once on any item (dry_run stops before Pay)
-python -m fksc run                 # watch the channel and buy
+python -m fksc discover            # browse normally; every SuperCoin offer seen is logged to debug/discover.jsonl
+python -m fksc buy <product-url>   # run the checkout once (dry_run stops before Pay)
+python -m fksc run                 # watch pages + dashboard at http://127.0.0.1:8080
 ```
-`buyer.dry_run: true` (the default) goes all the way to the payment page and stops before paying.
-Watch it work on a few real deals, then set it to `false`.
+From the dashboard you can turn auto-buy and dry run on or off, set the minimum coin-back %, the
+reload interval and spending caps, and add or remove watched pages and products. It also has a
+manual Buy box, and it shows browser notifications with a sound.
 
-## Payment options (`payment.method`)
-| method | what happens | needs you? |
-|---|---|---|
-| `card` | picks saved card ending `card_last4`, fills CVV, clicks **Pay ₹X**, then fills the OTP | only for the OTP, unless the OTP webhook is on |
-| `cod` | Cash on Delivery if offered: no card or OTP, so it's the quickest way to lock an order | sometimes a captcha |
-| `upi_wait` | stops on the payment page and alerts you | yes |
+## How detection works
+For each watched page, on every reload:
+1. Every product card on the page (each `/p/` link plus its card text) is checked for
+   "Earn N SuperCoins", "N SuperCoins back", "N% SuperCoins" and similar wording. Coins ÷ price
+   gives the coin-back ratio. Offers about *spending* coins ("using 50 SuperCoins") are ignored.
+2. The JSON responses Flipkart's own page loads are searched the same way.
 
-Indian card payments always require a bank OTP (an RBI rule), so no tool can skip it.
-
-### Hands-free OTP
-Set `otp_webhook.enabled: true` and `OTP_WEBHOOK_TOKEN` in `.env`. Install any Android
-"SMS to webhook" forwarder app on your phone, filter it to your bank's sender ID, and have it POST
-the SMS text to `http://<your-PC-LAN-IP>:8765/otp?token=<OTP_WEBHOOK_TOKEN>`. The bot pulls the
-OTP out of the SMS, types it into the bank page and submits it.
+## Payment and OTP
+`payment.method`: `card` (saved card matched by last 4 digits + CVV from `.env`), `cod`, or
+`upi_wait` (stops on the payment page). Indian card payments always need a bank OTP. With
+`otp_webhook.enabled`, the bank SMS can be forwarded to
+`POST http://<pc>:8765/otp?token=<OTP_WEBHOOK_TOKEN>`. On iPhone, set up a Shortcuts automation
+("Message contains OTP" → Get contents of URL) to do the forwarding.
 
 ## Safety rails
-- `buyer.max_order_amount`: read from the actual **Pay ₹X** button before clicking, so a wrong
-  link or wrong price is never paid.
-- `buyer.max_orders_per_day`, `buyer.max_spend_per_day`: kept in `state.json` across restarts.
-- `filter.require_100_percent`, `filter.max_price`, `filter.exclude_keywords`.
-- Each product (by `pid`) is bought at most once.
-- If anything is unexpected, the tab is left open and you get a Telegram "Saved Messages" alert,
-  so you can finish the purchase yourself.
+- `max_order_amount` is checked against the real "Pay ₹X" button before paying.
+- Daily order and spend caps are kept in `state.json`.
+- A product is not bought again within `rebuy_cooldown_h`.
+- `dry_run` is on by default.
+- The dashboard listens on 127.0.0.1 only, because anyone who can open it can trigger purchases.
 
-## When a step stops working
-Flipkart changes its pages often. Every step matches on visible button text
-(`BUY_NOW_TEXT`, `CHECKOUT_ADVANCE_TEXT`, `PAY_BUTTON_TEXT` at the top of `fksc/buyer.py`), and with
-`debug_screenshots: true` each step is saved to `./debug/`. Check the last screenshot and adjust
-the matching pattern.
+## Next
+Port the faster checkout used by the Tapworthy Android app: product-page banner check, then
+`cart` → `checkout` → `paymentToken` → `fkpay paywithdetails` → bank OTP, all as direct API
+calls from the logged-in page. Expect about 1s from detection to OTP.
 
 ## Caveats
-- Flipkart's terms prohibit automated purchasing. Flipkart has cancelled SuperCoin orders and
-  restricted accounts it flagged as bots. You run this at your own risk.
-- The checkout flow is tested against a local mock of Flipkart's steps, not the live site.
-  Start with `dry_run` and `python -m fksc buy <url>`.
-- A deal that lasts 2–3 seconds may still sell out between Buy Now and Pay. The bot reports that
-  as `sold out / unavailable`.
+Flipkart's terms prohibit automated purchasing, and Flipkart has cancelled SuperCoin orders and
+restricted accounts it flagged as bots. You use this at your own risk.

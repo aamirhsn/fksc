@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,10 +9,24 @@ import yaml
 from dotenv import load_dotenv
 
 
+RUNTIME_FILE = "runtime.json"  # settings changed from the dashboard, layered over config.yaml
+
+
 @dataclass
 class Config:
     raw: dict
     base_dir: Path
+
+    def set(self, dotted: str, value):
+        parts = dotted.split(".")
+        cur = self.raw
+        for part in parts[:-1]:
+            cur = cur.setdefault(part, {})
+        cur[parts[-1]] = value
+        overlay_path = self.base_dir / RUNTIME_FILE
+        overlay = json.loads(overlay_path.read_text()) if overlay_path.exists() else {}
+        overlay[dotted] = value
+        overlay_path.write_text(json.dumps(overlay, indent=2))
 
     def get(self, dotted: str, default=None):
         cur = self.raw
@@ -33,7 +48,15 @@ def load_config(path: str | os.PathLike = "config.yaml") -> Config:
         raise SystemExit(f"{path} not found. Copy config.example.yaml to config.yaml and edit it.")
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
-    return Config(raw=raw, base_dir=path.parent)
+    cfg = Config(raw=raw, base_dir=path.parent)
+    overlay_path = path.parent / RUNTIME_FILE
+    if overlay_path.exists():
+        for dotted, value in json.loads(overlay_path.read_text()).items():
+            parts, cur = dotted.split("."), cfg.raw
+            for part in parts[:-1]:
+                cur = cur.setdefault(part, {})
+            cur[parts[-1]] = value
+    return cfg
 
 
 def env(name: str, required: bool = False) -> str:

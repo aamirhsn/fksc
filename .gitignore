@@ -3,8 +3,7 @@ __pycache__/
 .venv/
 .env
 config.yaml
-*.session
-*.session-journal
+runtime.json
 browser_profile/
 state.json
 debug/

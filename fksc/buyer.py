@@ -128,13 +128,13 @@ class Buyer:
         return [page.main_frame] + [f for f in page.frames if f != page.main_frame]
 
     # ---------- main flow ----------
-    async def buy(self, url: str, hint_price: float | None = None) -> BuyResult:
+    async def buy(self, url: str, min_ratio: float | None = None) -> BuyResult:
         async with self._sem:
             t0 = time.monotonic()
             page = await self.ctx.new_page()
             page.set_default_timeout(self.timeout)
             try:
-                res = await self._buy(page, url)
+                res = await self._buy(page, url, min_ratio)
             except Exception as e:
                 await self._shot(page, "error")
                 res = BuyResult(False, "exception", f"{type(e).__name__}: {e}")
@@ -145,9 +145,16 @@ class Buyer:
                 await page.close()
             return res
 
-    async def _buy(self, page: Page, url: str) -> BuyResult:
+    async def _buy(self, page: Page, url: str, min_ratio: float | None = None) -> BuyResult:
         await page.goto(url, wait_until="domcontentloaded")
         await self._shot(page, "product")
+
+        # 0. Optional: re-check the coin offer on the product page itself (adds ~0.1-0.5s)
+        if min_ratio and self.cfg.get("buyer.verify_coins_on_product_page", False):
+            from .detect import detect
+            off = detect(url, await page.locator("body").inner_text())
+            if not off or off.ratio < min_ratio:
+                return BuyResult(False, "coins", f"coin offer not confirmed on product page ({off.ratio if off else 0:.0%})")
 
         # 1. Buy Now (race against "sold out")
         try:

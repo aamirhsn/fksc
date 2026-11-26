@@ -1,55 +1,45 @@
-telegram:
-  # Channels/groups to watch (username or numeric id). You must be a member.
-  channels:
-    - Flipkart_scdeals_PranayCC
-  session_name: fksc
-
-filter:
-  # Only act on posts that mention 100% SuperCoins / coinback.
-  # The channel only posts SC deals, but posts can also be "50% SC" etc.
-  require_100_percent: true
-  # Skip posts whose stated price is above this (INR). 0 = no limit.
-  max_price: 2000
-  # Skip posts containing any of these words (case-insensitive)
-  exclude_keywords: ["expired", "over", "oos", "sold out"]
+# Everything marked (dashboard) can also be changed live at http://127.0.0.1:8080
+scanner:
+  # Pages reloaded continuously; every product card on them is checked for SuperCoin offers.
+  # Use `python -m fksc discover` to find where Flipkart shows coin-back deals, then add those pages.
+  sources:
+    - https://www.flipkart.com/
+  # Individual product pages to keep checking
+  watchlist: []
+  min_ratio: 0.5          # (dashboard) 0.5 = 50% coin back, 1.0 = 100%
+  auto_buy: false         # (dashboard) false = alert only
+  interval_s: 4           # (dashboard) per page; lower = faster detection but higher block risk
+  settle_ms: 800          # wait after load for prices/offers to render
+  scroll_screens: 0       # scroll N screens to load lazy cards
+  rebuy_cooldown_h: 24    # don't buy the same product twice within this window
 
 buyer:
-  # dry_run: true -> goes all the way to the payment page and stops before paying.
-  # Keep this true until you've watched it work a few times.
-  dry_run: true
-  headless: false
+  dry_run: true           # (dashboard) stop right before paying
+  headless: false         # true = invisible browser (you can't take over a stuck checkout)
   profile_dir: browser_profile
-  # "chrome" = use installed Google Chrome; leave empty for Playwright's Chromium
-  browser_channel: chrome
-  # Hard caps, enforced on the amount shown on the "Pay" button before clicking it.
-  max_order_amount: 2000
-  max_orders_per_day: 5
-  max_spend_per_day: 5000
+  browser_channel: chrome # "chrome" = your installed Google Chrome; empty = Playwright Chromium
+  verify_coins_on_product_page: false  # re-check the coin offer after opening the product
+  max_order_amount: 2000  # (dashboard) read from the "Pay ₹X" button before clicking
+  max_orders_per_day: 5   # (dashboard)
+  max_spend_per_day: 5000 # (dashboard)
   max_parallel: 2
-  quantity: 1
-  # Save screenshots of every step to ./debug (useful to fix selectors)
   debug_screenshots: true
   step_timeout_ms: 8000
 
 payment:
-  # card | cod | upi_wait
-  #   card     -> saved credit card (matched by last 4 digits) + CVV from .env, then OTP
-  #   cod      -> Cash on Delivery if offered (no OTP; fastest way to lock an order)
-  #   upi_wait -> stops on payment page and alerts you to approve manually
-  method: card
-  card_last4: "1234"
+  method: card            # (dashboard) card | cod | upi_wait
+  card_last4: "1234"      # which saved card to use; CVV goes in .env
   use_new_card: false
-  # How long to wait for the bank OTP (from the webhook, or you typing it in the browser)
   otp_timeout_s: 120
 
 otp_webhook:
-  # Tiny HTTP server that accepts forwarded bank SMS and auto-fills the OTP.
   enabled: false
   host: 0.0.0.0
   port: 8765
 
+dashboard:
+  host: 127.0.0.1         # keep local; anyone who can open the dashboard can trigger purchases
+  port: 8080
+
 notify:
-  # Beep + desktop log line when something needs you
   beep: true
-  # Also send yourself a Telegram message in "Saved Messages"
-  telegram_saved_messages: true
