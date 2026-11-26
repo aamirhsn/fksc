@@ -1,5 +1,8 @@
 # fksc — Flipkart SuperCoin-back deal watcher and auto-buyer
 
+**On iPhone? Use the Safari userscript in [`ios/`](ios/README.md). It runs on the phone itself, with no computer needed.**
+The rest of this page covers the desktop (Python) version.
+
 Runs on your own computer. It keeps a logged-in Flipkart browser open, reloads the pages you choose,
 finds products whose SuperCoin offer is at least `min_ratio` of the price (default 50%), and
 runs checkout immediately. A local dashboard controls everything.
