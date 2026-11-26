@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FK SuperCoin Sniper
 // @namespace    fksc
-// @version      0.1.0
+// @version      0.1.1
 // @description  Watches Flipkart products for high SuperCoin cashback and checks out through Flipkart's own APIs, up to the bank OTP.
 // @match        https://www.flipkart.com/*
 // @grant        GM.getValue
@@ -62,8 +62,10 @@
     for (const m of html.matchAll(ACTION_RE)) if (m[1].startsWith('NOTIFY_ME')) notifyMe = true;
     if (!notifyMe && /Notify\s*Me/i.test(html) && !/Buy\s*Now/i.test(html)) notifyMe = true;
     const t = html.match(/<title>([^<]{0,200})/i);
+    if (!pid) pid = pidFromHtml(html);
     const lidM = pid && html.match(new RegExp('LST' + pid + '[A-Z0-9]+', 'i'));
     return {
+      pid,
       coins, price, notifyMe,
       pct: coins && price ? Math.round((coins / price) * 1000) / 10 : 0,
       title: t ? t[1].replace(/\s*[-|:]\s*Buy.*$/i, '').trim() : '',
@@ -71,14 +73,55 @@
     };
   }
 
+  // Product id (pid) is in the URL most of the time, but links from Google, shares and some
+  // mobile pages only have the /p/itm… path, so fall back to the page's own data.
+  function pidFromHtml(html) {
+    const res = [
+      /<link[^>]+rel=["']canonical["'][^>]+[?&]pid=([A-Z0-9]{10,20})/i,
+      /<meta[^>]+og:url[^>]+[?&]pid=([A-Z0-9]{10,20})/i,
+      /"productId"\s*:\s*"([A-Z0-9]{10,20})"/,
+      /"pid"\s*:\s*"([A-Z0-9]{10,20})"/,
+      /[?&]pid=([A-Z0-9]{10,20})/,
+    ];
+    for (const re of res) { const m = String(html || '').match(re); if (m) return m[1].toUpperCase(); }
+    return '';
+  }
+
   function parseProductUrl(href) {
     try {
       const u = new URL(href, location.href);
+      if (!/(^|\.)flipkart\.com$/i.test(u.hostname)) return null;
+      const itmM = u.pathname.match(/\/p\/(itm[0-9a-z]+)/i);
       const pid = (u.searchParams.get('pid') || '').toUpperCase();
-      if (!pid || !/\/p\//.test(u.pathname)) return null;
+      if (!pid && !itmM) return null;
       const lid = (u.searchParams.get('lid') || '').toUpperCase();
-      return { pid, lid, url: u.origin + u.pathname + '?pid=' + pid + (lid ? '&lid=' + lid : '') };
+      const path = itmM ? u.pathname : '/product/p/itm';
+      const qs = [pid && 'pid=' + pid, lid && 'lid=' + lid].filter(Boolean).join('&');
+      return { pid, lid, itm: itmM ? itmM[1].toLowerCase() : '', url: 'https://www.flipkart.com' + path + (qs ? '?' + qs : '') };
     } catch (_) { return null; }
+  }
+  const keyOf = (w) => w.pid || w.itm;
+
+  function productFromThisPage() {
+    const html = document.documentElement.innerHTML;
+    let p = parseProductUrl(location.href);
+    if (!p || !p.pid) {
+      const canon = document.querySelector('link[rel="canonical"]');
+      const fromCanon = canon && parseProductUrl(canon.href);
+      p = p || fromCanon;
+      if (!p) {
+        // not a /p/ URL at all, but the page may still be a product page
+        const pid = pidFromHtml(html);
+        if (!pid || !/Buy\s*Now|Add\s*to\s*cart|Notify\s*Me/i.test(document.body.innerText)) return null;
+        p = { pid: '', lid: '', itm: '', url: '' };
+      }
+      p.pid = p.pid || (fromCanon && fromCanon.pid) || pidFromHtml(html);
+      if (!p.pid) return null;
+      p.url = 'https://www.flipkart.com' + (p.itm ? new URL(p.url || location.href).pathname : '/product/p/itm') + '?pid=' + p.pid;
+    }
+    if (!p.lid) p.lid = analyze(html, p.pid).lid;
+    if (p.lid && !/[?&]lid=/.test(p.url)) p.url += '&lid=' + p.lid;
+    return p;
   }
 
   // ---------------------------------------------------------------- Flipkart APIs
@@ -180,6 +223,7 @@
     if (info.price > S.maxPrice) return fail('price ₹' + info.price + ' > max ₹' + S.maxPrice);
     if (!card && !S.dryRun) return fail('no card saved');
     const lid = w.lid || info.lid;
+    if (!w.pid) return fail('product id not found for ' + (w.title || w.url));
     if (!lid) return fail('listing id (lid) not found for ' + w.pid);
 
     step('Adding to cart…');
@@ -206,7 +250,7 @@
     step('Paying ₹' + info.price + ' with card …' + String(card.number).slice(-4));
     const paid = await payWithCard();
     if (paid.ok) {
-      day.orders += 1; day.bought[w.pid] = Date.now(); await GM_.setValue('day', day);
+      day.orders += 1; day.bought[keyOf(w)] = Date.now(); await GM_.setValue('day', day);
       alertUser('Bank OTP page opening (' + (Math.round(performance.now() - t0)) + 'ms). Use the SMS code suggestion above the keyboard.');
       await stopRunning();
       submitAction(paid.action);
@@ -230,6 +274,7 @@
     if (r.status === 429 || r.status === 403) throw Object.assign(new Error('rate limited (' + r.status + ')'), { backoff: true });
     const html = await r.text();
     const info = analyze(html, w.pid);
+    if (!w.pid && info.pid) { w.pid = info.pid; saveWatch(); }
     checks++;
     w.last = { t: Date.now(), pct: info.pct, coins: info.coins, price: info.price, notifyMe: info.notifyMe };
     if (!w.title && info.title) { w.title = info.title; saveWatch(); }
@@ -259,10 +304,10 @@
         const hit = info.pct >= S.minPct && !info.notifyMe;
         if (!hit || !running || busy) continue;
         rollDay();
-        if (day.bought[w.pid]) continue;
+        if (day.bought[keyOf(w)]) continue;
         log('HIT ' + info.pct + '% (' + info.coins + ' SC / ₹' + info.price + ') ' + (w.title || w.pid));
         beep();
-        if (!S.autoBuy) { alertUser(info.pct + '% SuperCoins live: ' + (w.title || w.pid)); day.bought[w.pid] = Date.now(); continue; }
+        if (!S.autoBuy) { alertUser(info.pct + '% SuperCoins live: ' + (w.title || w.pid)); day.bought[keyOf(w)] = Date.now(); continue; }
         busy = true;
         try { await checkout(w, info); } catch (e) { alertUser('Checkout error: ' + e.message); }
         busy = false;
@@ -389,7 +434,7 @@
     for (const w of watch) {
       const row = document.createElement('div'); row.className = 'w';
       const left = document.createElement('div');
-      const t = document.createElement('div'); t.className = 't'; t.textContent = w.title || w.pid;
+      const t = document.createElement('div'); t.className = 't'; t.textContent = w.title || w.pid || w.itm;
       const s = document.createElement('div');
       if (w.last) {
         s.className = w.last.pct >= S.minPct ? 'hit' : 'mut';
@@ -399,15 +444,15 @@
       } else { s.className = 'mut'; s.textContent = 'not checked yet'; }
       left.append(t, s);
       const del = document.createElement('button'); del.className = 'b g'; del.textContent = '✕';
-      del.onclick = () => { watch = watch.filter((x) => x.pid !== w.pid); saveWatch(); render(); };
+      del.onclick = () => { watch = watch.filter((x) => keyOf(x) !== keyOf(w)); saveWatch(); render(); };
       row.append(left, del); list.append(row);
     }
     if (running) setStatus('Running · ' + watch.length + ' products · ' + checks + ' checks' + (S.autoBuy ? (S.dryRun ? ' · auto-buy (dry run)' : ' · AUTO-BUY LIVE') : ' · alert only'));
   }
 
   function addProduct(p, title) {
-    if (!p || watch.some((w) => w.pid === p.pid)) return false;
-    watch.push({ pid: p.pid, lid: p.lid, url: p.url, title: title || '' });
+    if (!p || watch.some((w) => (p.pid && w.pid === p.pid) || (p.itm && w.itm === p.itm))) return false;
+    watch.push({ pid: p.pid, lid: p.lid, itm: p.itm, url: p.url, title: title || '' });
     return true;
   }
 
@@ -415,10 +460,9 @@
   $('close').onclick = () => $('panel').classList.remove('open');
   $('toggle').onclick = () => (running ? stopRunning() : start());
   $('addThis').onclick = () => {
-    const p = parseProductUrl(location.href);
-    if (!p) return alertUser('Open a product page first');
-    if (!p.lid) p.lid = analyze(document.documentElement.innerHTML, p.pid).lid;
-    log(addProduct(p, document.title.replace(/\s*[-|:]\s*Buy.*$/i, '')) ? 'Added ' + p.pid : 'Already watching');
+    const p = productFromThisPage();
+    if (!p) return alertUser('Couldn\u2019t find a product id on this page (' + location.pathname.slice(0, 60) + '). Scroll until the price and Buy Now button show, then try again.');
+    log(addProduct(p, document.title.replace(/\s*[-|:]\s*Buy.*$/i, '')) ? 'Added ' + p.pid + (p.lid ? '' : ' (listing id will be read on first check)') : 'Already watching');
     saveWatch(); render();
   };
   $('addPage').onclick = () => {
@@ -449,5 +493,5 @@
   render();
 
   // test hook (only used by the automated tests)
-  window.__fksc = { analyze, parseProductUrl, start, stopRunning, get watch() { return watch; }, S };
+  window.__fksc = { analyze, parseProductUrl, productFromThisPage, start, stopRunning, get watch() { return watch; }, S };
 })();

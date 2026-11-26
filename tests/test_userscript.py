@@ -106,3 +106,35 @@ def test_dry_run_stops_before_payment():
     assert any("/api/5/checkout" in c[1] for c in calls)
     assert not any("paymentToken" in c[1] or "fkpay" in c[1] for c in calls)
     assert final_url.startswith("https://www.flipkart.com")
+
+
+async def _product_from_page(url, html):
+    async with pw.async_playwright() as p:
+        browser = await p.chromium.launch(executable_path=os.environ.get("CHROMIUM_PATH") or None)
+        page = await browser.new_page()
+        await page.route("**/*", lambda r: r.fulfill(content_type="text/html", body=html))
+        await page.add_init_script("document.addEventListener('DOMContentLoaded',()=>{" + SCRIPT + "});")
+        await page.goto(url)
+        await page.wait_for_function("window.__fksc")
+        res = await page.evaluate("window.__fksc.productFromThisPage()")
+        await browser.close()
+        return res
+
+
+def test_add_product_without_pid_in_url():
+    # e.g. opened from Google: /p/itm… with no ?pid=
+    html = product_html(10).replace("<head>", '<head><script>var s={"productId":"%s"}</script>' % PID)
+    res = asyncio.run(_product_from_page("https://www.flipkart.com/steel-bottle/p/itmabc?srsltid=xyz", html))
+    assert res["pid"] == PID and res["lid"] == LID
+    assert res["url"] == f"https://www.flipkart.com/steel-bottle/p/itmabc?pid={PID}&lid={LID}"
+
+
+def test_add_product_from_canonical_link():
+    html = product_html(10).replace("<head>", f'<head><link rel="canonical" href="https://www.flipkart.com/steel-bottle/p/itmabc?pid={PID}">')
+    res = asyncio.run(_product_from_page("https://www.flipkart.com/some/redirected/page", html))
+    assert res["pid"] == PID
+
+
+def test_url_with_pid_still_works():
+    res = asyncio.run(_product_from_page(f"https://www.flipkart.com/steel-bottle/p/itmabc?pid={PID}&lid={LID}&marketplace=FLIPKART", product_html(10)))
+    assert res["pid"] == PID and res["lid"] == LID
