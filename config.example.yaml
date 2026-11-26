@@ -1,0 +1,55 @@
+telegram:
+  # Channels/groups to watch (username or numeric id). You must be a member.
+  channels:
+    - Flipkart_scdeals_PranayCC
+  session_name: fksc
+
+filter:
+  # Only act on posts that mention 100% SuperCoins / coinback.
+  # The channel only posts SC deals, but posts can also be "50% SC" etc.
+  require_100_percent: true
+  # Skip posts whose stated price is above this (INR). 0 = no limit.
+  max_price: 2000
+  # Skip posts containing any of these words (case-insensitive)
+  exclude_keywords: ["expired", "over", "oos", "sold out"]
+
+buyer:
+  # dry_run: true -> goes all the way to the payment page and stops before paying.
+  # Keep this true until you've watched it work a few times.
+  dry_run: true
+  headless: false
+  profile_dir: browser_profile
+  # "chrome" = use installed Google Chrome; leave empty for Playwright's Chromium
+  browser_channel: chrome
+  # Hard caps, enforced on the amount shown on the "Pay" button before clicking it.
+  max_order_amount: 2000
+  max_orders_per_day: 5
+  max_spend_per_day: 5000
+  max_parallel: 2
+  quantity: 1
+  # Save screenshots of every step to ./debug (useful to fix selectors)
+  debug_screenshots: true
+  step_timeout_ms: 8000
+
+payment:
+  # card | cod | upi_wait
+  #   card     -> saved credit card (matched by last 4 digits) + CVV from .env, then OTP
+  #   cod      -> Cash on Delivery if offered (no OTP; fastest way to lock an order)
+  #   upi_wait -> stops on payment page and alerts you to approve manually
+  method: card
+  card_last4: "1234"
+  use_new_card: false
+  # How long to wait for the bank OTP (from the webhook, or you typing it in the browser)
+  otp_timeout_s: 120
+
+otp_webhook:
+  # Tiny HTTP server that accepts forwarded bank SMS and auto-fills the OTP.
+  enabled: false
+  host: 0.0.0.0
+  port: 8765
+
+notify:
+  # Beep + desktop log line when something needs you
+  beep: true
+  # Also send yourself a Telegram message in "Saved Messages"
+  telegram_saved_messages: true

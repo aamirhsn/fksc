@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+config.yaml
+*.session
+*.session-journal
+browser_profile/
+state.json
+debug/
